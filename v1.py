@@ -78,91 +78,126 @@ GPIO_PIN = 17
 
 class _TTSBackendWindows:
     """
-    Windows TTS via PowerShell + SAPI5 SpeechSynthesizer.
+    Windows TTS via a single persistent PowerShell process.
 
-    Why not pyttsx3?
-    ----------------
-    pyttsx3's Windows driver initialises a COM SpeechSynthesizer object and
-    calls runAndWait() which spins a private event loop.  Between consecutive
-    runAndWait() calls the SAPI5 COM object does not always reset cleanly —
-    the second and subsequent utterances silently fail with an empty exception,
-    killing the queue worker.  No amount of threading fixes helps because the
-    failure is inside the COM layer, not in our code.
+    Why persistent?
+    ---------------
+    Spawning one powershell.exe per utterance costs 1.5–3 s of CLR + SAPI5
+    cold-start time before the first syllable.  Short phrases (< 1 s of audio)
+    are inaudible because the startup silence swallows the perceived onset.
 
-    Solution: same subprocess model used on Pi for espeak-ng.
-    Each utterance is a separate PowerShell process that exits when done.
-    Stopping = killing the process.  No shared state, no COM threading issues.
+    Design
+    ------
+    One PowerShell process is started at __init__ and kept alive.  It runs a
+    loop that reads lines from its stdin pipe:
+      - ordinary text  → $s.Speak(text)  [synchronous, blocks until done]
+      - "__STOP__"     → $s.SpeakAsyncCancelAll()  [clears current speech]
+      - "__EXIT__"     → exits the loop
 
-    PowerShell is available on every Windows 10/11 system.
-    Rate range: -10 (slowest) to 10 (fastest).  0 is default (~150 wpm).
+    speak() writes a line to the pipe.
+    stop()  drains the Python-side queue, then writes "__STOP__" to the pipe.
+    No per-utterance process spawning; no COM threading issues.
     """
 
-    # SAPI5 rate: maps words-per-minute (≈150) to SAPI scale (-10..10)
-    # 150 wpm ≈ rate 0;  we expose SPEECH_RATE_WIN as wpm and convert.
+    # SAPI5 rate: -10 (slowest) to 10 (fastest); 0 ≈ 150 wpm
     @staticmethod
     def _wpm_to_sapi_rate(wpm: int) -> int:
-        # Rough linear mapping: 100wpm→-2, 150wpm→0, 200wpm→2, 300wpm→5
-        rate = round((wpm - 150) / 25)
-        return max(-10, min(10, rate))
+        return max(-10, min(10, round((wpm - 150) / 25)))
+
+    # PowerShell script run once for the lifetime of the program.
+    # Uses synchronous $s.Speak() so each line blocks until audio finishes —
+    # the next stdin.ReadLine() is not reached until speaking is done.
+    _PS_SCRIPT = r"""
+Add-Type -AssemblyName System.Speech
+$s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$s.Rate   = {rate}
+$s.Volume = 100
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+while ($true) {{
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line)            {{ break }}
+    if ($line -eq '__EXIT__')       {{ break }}
+    if ($line -eq '__STOP__')       {{ $s.SpeakAsyncCancelAll() }}
+    elseif ($line.Trim() -ne '')    {{ $s.Speak($line) }}
+}}
+"""
 
     def __init__(self):
-        self._lock = threading.Lock()
-        self._proc: subprocess.Popen | None = None
-        self._sapi_rate = self._wpm_to_sapi_rate(SPEECH_RATE_WIN)
+        self._rate      = self._wpm_to_sapi_rate(SPEECH_RATE_WIN)
+        self._lock      = threading.Lock()   # guards _proc and _stopped
+        self._stopped   = False              # set during a stop() call
+        self._proc      = self._launch()
 
-    def _build_ps_command(self, text: str) -> list[str]:
-        # Escape single-quotes in the text for PowerShell string literal
-        safe = text.replace("'", "''")
-        ps_script = (
-            "Add-Type -AssemblyName System.Speech; "
-            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            f"$s.Rate = {self._sapi_rate}; "
-            f"$s.Volume = 100; "
-            f"$s.Speak('{safe}');"
+    def _launch(self) -> subprocess.Popen:
+        script = self._PS_SCRIPT.format(rate=self._rate)
+        proc   = subprocess.Popen(
+            [
+                "powershell", "-NoProfile", "-NonInteractive",
+                "-WindowStyle", "Hidden",
+                "-Command", script,
+            ],
+            stdin  = subprocess.PIPE,
+            stdout = subprocess.DEVNULL,
+            stderr = subprocess.DEVNULL,
+            text   = True,
+            encoding = "utf-8",
         )
-        return [
-            "powershell", "-NoProfile", "-NonInteractive",
-            "-WindowStyle", "Hidden",
-            "-Command", ps_script,
-        ]
+        return proc
+
+    def _writeline(self, line: str):
+        """Write one line to the PowerShell stdin pipe, restarting if needed."""
+        with self._lock:
+            proc = self._proc
+        try:
+            proc.stdin.write(line + "\n")
+            proc.stdin.flush()
+        except (OSError, BrokenPipeError):
+            # Process died unexpectedly — restart it and retry once
+            print("[TTS] PowerShell process died; restarting.")
+            with self._lock:
+                self._proc = self._launch()
+                proc = self._proc
+            try:
+                proc.stdin.write(line + "\n")
+                proc.stdin.flush()
+            except Exception as exc:
+                print(f"[TTS] Could not restart PowerShell: {exc}")
 
     def speak(self, text: str):
         if not text.strip():
             return
-        self.stop()                        # kill any running utterance first
-        cmd = self._build_ps_command(text)
-        with self._lock:
-            try:
-                self._proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except FileNotFoundError:
-                print("[TTS] powershell not found — cannot speak.")
+        # Escape any bare newlines so the pipe sees a single logical line
+        safe = text.replace("\r", " ").replace("\n", " ")
+        self._writeline(safe)
 
     def stop(self):
-        with self._lock:
-            if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
-            self._proc = None
+        """Cancel current speech and clear the PS-side queue via __STOP__."""
+        self._writeline("__STOP__")
 
     def shutdown(self):
-        self.stop()
+        try:
+            self._writeline("__EXIT__")
+            with self._lock:
+                proc = self._proc
+            proc.stdin.close()
+            proc.wait(timeout=3.0)
+        except Exception:
+            with self._lock:
+                self._proc.kill()
 
 
 class _TTSBackendEspeakNG:
     """
-    espeak-ng via subprocess. Each utterance is a separate process so stopping
-    is simply killing the current process – no thread-safety concerns at all.
+    espeak-ng via subprocess with a sequential worker queue.
+    speak() enqueues; stop() is an explicit user action only — never called
+    inside speak() — so consecutive speak() calls play in order, not clobber.
     """
     def __init__(self):
         self._lock   = threading.Lock()
         self._proc: subprocess.Popen | None = None
+        self._q      = queue.Queue()
+        self._worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self._worker_thread.start()
 
     def _espeak_available(self) -> bool:
         try:
@@ -177,27 +212,46 @@ class _TTSBackendEspeakNG:
             return False
 
     def speak(self, text: str):
+        """Enqueue text. Never kills a running utterance — use stop() for that."""
         if not text.strip():
             return
-        self.stop()
-        cmd = [
-            "espeak-ng",
-            "-v", ESPEAK_VOICE,
-            "-s", str(ESPEAK_SPEED),
-            "-a", str(ESPEAK_AMPLITUDE),
-            text,
-        ]
-        with self._lock:
+        self._q.put(text)
+
+    def _worker(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            cmd = [
+                "espeak-ng",
+                "-v", ESPEAK_VOICE,
+                "-s", str(ESPEAK_SPEED),
+                "-a", str(ESPEAK_AMPLITUDE),
+                item,
+            ]
             try:
-                self._proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                with self._lock:
+                    self._proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                self._proc.wait()
             except FileNotFoundError:
                 print("[TTS] espeak-ng not found. Install with: sudo apt install espeak-ng")
+            except Exception as exc:
+                print(f"[TTS] espeak-ng error: {exc}")
+            finally:
+                with self._lock:
+                    self._proc = None
 
     def stop(self):
+        """Drain queue then kill current process. Explicit user action only."""
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
         with self._lock:
             if self._proc and self._proc.poll() is None:
                 self._proc.terminate()
@@ -209,6 +263,8 @@ class _TTSBackendEspeakNG:
 
     def shutdown(self):
         self.stop()
+        self._q.put(None)
+        self._worker_thread.join(timeout=3.0)
 
 
 def _build_tts():
@@ -432,8 +488,6 @@ def capture_and_read(frame: np.ndarray, tts, state: dict):
             tts.speak("Still processing. Please wait.")
             return
         state["ocr_busy"] = True
-
-    tts.stop()
 
     t = threading.Thread(
         target=_ocr_worker,
