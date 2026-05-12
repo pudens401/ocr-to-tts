@@ -6,7 +6,7 @@ aloud via text-to-speech.
 
 Platform support
 ----------------
-  Windows 11  : pyttsx3 (SAPI5)   + cv2.CAP_DSHOW  + windowed display
+  Windows 11  : PowerShell SAPI5  + cv2.CAP_DSHOW  + windowed display
   Raspberry Pi 5 (Pi OS Bookworm) : espeak-ng (subprocess) + cv2.CAP_V4L2 + headless
 
 Controls (windowed mode)
@@ -78,56 +78,81 @@ GPIO_PIN = 17
 
 class _TTSBackendWindows:
     """
-    pyttsx3 with SAPI5, running entirely on a single dedicated thread so the
-    COM-initialised engine is never touched from another thread.
-    """
-    def __init__(self):
-        self._q: queue.Queue = queue.Queue()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
+    Windows TTS via PowerShell + SAPI5 SpeechSynthesizer.
 
-    def _worker(self):
-        import pyttsx3  # imported here so the engine lives on this thread
-        engine = pyttsx3.init()
-        engine.setProperty("rate", SPEECH_RATE_WIN)
-        engine.setProperty("volume", 1.0)
-        while True:
-            item = self._q.get()
-            if item is None:          # sentinel – shutdown
-                engine.stop()
-                return
-            cmd, payload = item
-            if cmd == "say":
-                try:
-                    engine.say(payload)
-                    engine.runAndWait()
-                except Exception:
-                    pass
-            elif cmd == "stop":
-                try:
-                    engine.stop()
-                except Exception:
-                    pass
-            self._q.task_done()
+    Why not pyttsx3?
+    ----------------
+    pyttsx3's Windows driver initialises a COM SpeechSynthesizer object and
+    calls runAndWait() which spins a private event loop.  Between consecutive
+    runAndWait() calls the SAPI5 COM object does not always reset cleanly —
+    the second and subsequent utterances silently fail with an empty exception,
+    killing the queue worker.  No amount of threading fixes helps because the
+    failure is inside the COM layer, not in our code.
+
+    Solution: same subprocess model used on Pi for espeak-ng.
+    Each utterance is a separate PowerShell process that exits when done.
+    Stopping = killing the process.  No shared state, no COM threading issues.
+
+    PowerShell is available on every Windows 10/11 system.
+    Rate range: -10 (slowest) to 10 (fastest).  0 is default (~150 wpm).
+    """
+
+    # SAPI5 rate: maps words-per-minute (≈150) to SAPI scale (-10..10)
+    # 150 wpm ≈ rate 0;  we expose SPEECH_RATE_WIN as wpm and convert.
+    @staticmethod
+    def _wpm_to_sapi_rate(wpm: int) -> int:
+        # Rough linear mapping: 100wpm→-2, 150wpm→0, 200wpm→2, 300wpm→5
+        rate = round((wpm - 150) / 25)
+        return max(-10, min(10, rate))
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._sapi_rate = self._wpm_to_sapi_rate(SPEECH_RATE_WIN)
+
+    def _build_ps_command(self, text: str) -> list[str]:
+        # Escape single-quotes in the text for PowerShell string literal
+        safe = text.replace("'", "''")
+        ps_script = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$s.Rate = {self._sapi_rate}; "
+            f"$s.Volume = 100; "
+            f"$s.Speak('{safe}');"
+        )
+        return [
+            "powershell", "-NoProfile", "-NonInteractive",
+            "-WindowStyle", "Hidden",
+            "-Command", ps_script,
+        ]
 
     def speak(self, text: str):
-        self._q.put(("say", text))
+        if not text.strip():
+            return
+        self.stop()                        # kill any running utterance first
+        cmd = self._build_ps_command(text)
+        with self._lock:
+            try:
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                print("[TTS] powershell not found — cannot speak.")
 
     def stop(self):
-        # Drain the queue then inject a stop command so the engine halts the
-        # current utterance as soon as the worker next reads from the queue.
-        # We do NOT call engine.stop() from this thread.
-        try:
-            while True:
-                self._q.get_nowait()
-                self._q.task_done()
-        except queue.Empty:
-            pass
-        self._q.put(("stop", ""))
+        with self._lock:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+            self._proc = None
 
     def shutdown(self):
-        self._q.put(None)
-        self._thread.join(timeout=3.0)
+        self.stop()
 
 
 class _TTSBackendEspeakNG:
@@ -329,12 +354,11 @@ def save_capture(image: np.ndarray, filename: str) -> str:
 # Core capture-and-read routine
 # ─────────────────────────────────────────────
 
-def capture_and_read(frame: np.ndarray, tts, state: dict):
+def _ocr_worker(frame: np.ndarray, tts, state: dict):
     """
-    Runs synchronously on the main thread.  TTS calls are non-blocking
-    (queued / subprocess), so the camera loop is not frozen waiting for audio.
+    Runs on a dedicated thread so the main loop (and cv2.waitKey) keeps
+    ticking during the 2-5 second Tesseract call.
     """
-    tts.stop()
     tts.speak("Image captured. Checking image quality.")
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -342,11 +366,15 @@ def capture_and_read(frame: np.ndarray, tts, state: dict):
     ok, msg = check_brightness(gray)
     if not ok:
         tts.speak(msg)
+        with state["lock"]:
+            state["ocr_busy"] = False
         return
 
     ok, msg = check_blur(gray)
     if not ok:
         tts.speak(msg)
+        with state["lock"]:
+            state["ocr_busy"] = False
         return
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -361,6 +389,8 @@ def capture_and_read(frame: np.ndarray, tts, state: dict):
 
     if not check_text_density(thresh):
         tts.speak("No readable text found.")
+        with state["lock"]:
+            state["ocr_busy"] = False
         return
 
     try:
@@ -375,12 +405,13 @@ def capture_and_read(frame: np.ndarray, tts, state: dict):
 
     if len(text) < MIN_TEXT_LENGTH:
         tts.speak("No readable text found.")
+        with state["lock"]:
+            state["ocr_busy"] = False
         return
 
-    # Thread-safe write: GIL makes dict assignment atomic in CPython, but we
-    # use a lock to be correct regardless of implementation.
     with state["lock"]:
         state["last_text"] = text
+        state["ocr_busy"]  = False
 
     print("\n--- OCR TEXT ---")
     print(text)
@@ -388,6 +419,28 @@ def capture_and_read(frame: np.ndarray, tts, state: dict):
 
     tts.speak(text)
     tts.speak("Reading finished. Turn to the next page when ready.")
+
+
+def capture_and_read(frame: np.ndarray, tts, state: dict):
+    """
+    Entry point called from the main loop on the main thread.
+    Guards against overlapping captures with ocr_busy flag, then hands off
+    to a background thread so cv2.waitKey() keeps running during OCR.
+    """
+    with state["lock"]:
+        if state["ocr_busy"]:
+            tts.speak("Still processing. Please wait.")
+            return
+        state["ocr_busy"] = True
+
+    tts.stop()
+
+    t = threading.Thread(
+        target=_ocr_worker,
+        args=(frame.copy(), tts, state),   # copy frame — camera will overwrite it
+        daemon=True,
+    )
+    t.start()
 
 
 # ─────────────────────────────────────────────
@@ -502,6 +555,7 @@ def main():
     # ── Shared state (protected by a lock) ─────
     state: dict = {
         "last_text": "",
+        "ocr_busy":  False,
         "lock":      threading.Lock(),
     }
 
