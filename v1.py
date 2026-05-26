@@ -24,6 +24,12 @@ Headless mode (Pi without display)
   If RPi.GPIO is not installed the GPIO path is silently skipped.
 """
 
+import os
+# If the Qt platform plugin (e.g. "wayland") is missing, prefer X11's
+# `xcb` backend to avoid the Qt plugin error printed by OpenCV's Qt
+# build. This must be set before importing `cv2` so Qt picks it up.
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
 import cv2
 import pytesseract
 import numpy as np
@@ -60,7 +66,7 @@ ESPEAK_AMPLITUDE      = 100          # espeak-ng amplitude 0-200
 
 MIN_BRIGHTNESS        = 70
 MAX_BRIGHTNESS        = 230
-MIN_VARIANCE_LAPLACIAN = 80.0
+MIN_VARIANCE_LAPLACIAN = 100.0
 MIN_TEXT_DENSITY      = 0.01
 MIN_TEXT_LENGTH       = 30
 
@@ -426,7 +432,7 @@ def _ocr_worker(frame: np.ndarray, tts, state: dict):
             state["ocr_busy"] = False
         return
 
-    ok, msg = check_blur(gray)
+    #ok, msg = check_blur(gray)
     if not ok:
         tts.speak(msg)
         with state["lock"]:
@@ -443,11 +449,11 @@ def _ocr_worker(frame: np.ndarray, tts, state: dict):
 
     processed, thresh = preprocess_image(frame)
 
-    if not check_text_density(thresh):
-        tts.speak("No readable text found.")
-        with state["lock"]:
-            state["ocr_busy"] = False
-        return
+    #if not check_text_density(thresh):
+        #tts.speak("No readable text found.")
+       # with state["lock"]:
+         #   state["ocr_busy"] = False
+        #return
 
     try:
         save_capture(processed, f"capture_{timestamp}_processed.png")
