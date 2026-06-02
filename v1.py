@@ -64,6 +64,14 @@ ESPEAK_VOICE          = "en"         # espeak-ng voice tag
 ESPEAK_SPEED          = 150          # espeak-ng words-per-minute
 ESPEAK_AMPLITUDE      = 100          # espeak-ng amplitude 0-200
 
+# Page edge detection / auto capture
+AUTO_CAPTURE_ENABLED  = True
+PAGE_STABLE_FRAMES    = 8            # consecutive frames before auto-capture
+AUTO_CAPTURE_COOLDOWN = 2.5          # seconds between auto-captures
+DETECT_HEIGHT         = 500          # resize height for edge detection
+MIN_PAGE_AREA_RATIO   = 0.20         # min contour area vs frame area
+MAX_QUAD_SHIFT        = 20.0         # px mean corner movement to be “stable”
+
 MIN_BRIGHTNESS        = 70
 MAX_BRIGHTNESS        = 230
 MIN_VARIANCE_LAPLACIAN = 100.0
@@ -382,6 +390,71 @@ def preprocess_image(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ─────────────────────────────────────────────
+# Page edge detection + perspective transform
+# ─────────────────────────────────────────────
+
+def _order_points(pts: np.ndarray) -> np.ndarray:
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    rect = _order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_width = max(int(width_a), int(width_b))
+
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_height = max(int(height_a), int(height_b))
+
+    dst = np.array(
+        [[0, 0], [max_width - 1, 0], [max_width - 1, max_height - 1], [0, max_height - 1]],
+        dtype="float32",
+    )
+
+    matrix = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(image, matrix, (max_width, max_height))
+
+
+def detect_page_quad(frame: np.ndarray) -> np.ndarray | None:
+    h, w = frame.shape[:2]
+    scale = DETECT_HEIGHT / float(h)
+    resized = cv2.resize(frame, (int(w * scale), DETECT_HEIGHT))
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    frame_area = float(resized.shape[0] * resized.shape[1])
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    for cnt in contours[:5]:
+        area = cv2.contourArea(cnt)
+        if area / frame_area < MIN_PAGE_AREA_RATIO:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4:
+            quad = approx.reshape(4, 2).astype("float32")
+            quad /= scale
+            return quad
+    return None
+
+
+# ─────────────────────────────────────────────
 # OCR
 # ─────────────────────────────────────────────
 
@@ -416,28 +489,22 @@ def save_capture(image: np.ndarray, filename: str) -> str:
 # Core capture-and-read routine
 # ─────────────────────────────────────────────
 
-def _ocr_worker(frame: np.ndarray, tts, state: dict):
+def _ocr_worker(frame: np.ndarray, tts, state: dict, page_quad: np.ndarray | None):
     """
     Runs on a dedicated thread so the main loop (and cv2.waitKey) keeps
     ticking during the 2-5 second Tesseract call.
     """
     tts.speak("Image captured. Checking image quality.")
 
+    if page_quad is not None:
+        try:
+            frame = _four_point_transform(frame, page_quad)
+        except Exception:
+            pass
+
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    ok, msg = check_brightness(gray)
-    if not ok:
-        tts.speak(msg)
-        with state["lock"]:
-            state["ocr_busy"] = False
-        return
 
-    #ok, msg = check_blur(gray)
-    if not ok:
-        tts.speak(msg)
-        with state["lock"]:
-            state["ocr_busy"] = False
-        return
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
@@ -465,12 +532,6 @@ def _ocr_worker(frame: np.ndarray, tts, state: dict):
     raw_text = extract_text(processed)
     text     = clean_text(raw_text)
 
-    if len(text) < MIN_TEXT_LENGTH:
-        tts.speak("No readable text found.")
-        with state["lock"]:
-            state["ocr_busy"] = False
-        return
-
     with state["lock"]:
         state["last_text"] = text
         state["ocr_busy"]  = False
@@ -483,7 +544,7 @@ def _ocr_worker(frame: np.ndarray, tts, state: dict):
     tts.speak("Reading finished. Turn to the next page when ready.")
 
 
-def capture_and_read(frame: np.ndarray, tts, state: dict):
+def capture_and_read(frame: np.ndarray, tts, state: dict, page_quad: np.ndarray | None = None):
     """
     Entry point called from the main loop on the main thread.
     Guards against overlapping captures with ocr_busy flag, then hands off
@@ -497,7 +558,7 @@ def capture_and_read(frame: np.ndarray, tts, state: dict):
 
     t = threading.Thread(
         target=_ocr_worker,
-        args=(frame.copy(), tts, state),   # copy frame — camera will overwrite it
+        args=(frame.copy(), tts, state, page_quad),   # copy frame — camera will overwrite it
         daemon=True,
     )
     t.start()
@@ -513,8 +574,7 @@ def _stdin_input_thread(cmd_queue: queue.Queue):
     while True:
         try:
             line = sys.stdin.readline()
-            if not line:        # EOF
-                cmd_queue.put("q")
+            if not line:        # EOF (e.g., systemd service with no stdin)
                 return
             ch = line.strip().lower()
             if ch in ("", "c", " "):
@@ -529,7 +589,6 @@ def _stdin_input_thread(cmd_queue: queue.Queue):
                 cmd_queue.put("q")
                 return
         except (EOFError, OSError):
-            cmd_queue.put("q")
             return
 
 
@@ -617,16 +676,23 @@ def main():
         "last_text": "",
         "ocr_busy":  False,
         "lock":      threading.Lock(),
+        "last_page_quad": None,
+        "stable_frames": 0,
+        "last_auto_capture": 0.0,
     }
 
     # ── Windowed vs headless ───────────────────
     cmd_queue: queue.Queue = queue.Queue()
 
     if HEADLESS:
-        stdin_thread = threading.Thread(
-            target=_stdin_input_thread, args=(cmd_queue,), daemon=True
-        )
-        stdin_thread.start()
+        # Under systemd services, stdin is typically not attached to a TTY and
+        # readline() returns EOF immediately. Only start the stdin thread when
+        # stdin is interactive so the service doesn't exit on EOF.
+        if sys.stdin.isatty():
+            stdin_thread = threading.Thread(
+                target=_stdin_input_thread, args=(cmd_queue,), daemon=True
+            )
+            stdin_thread.start()
         _try_setup_gpio(cmd_queue)
     else:
         cv2.namedWindow("OCR to TTS Reader", cv2.WINDOW_NORMAL)
@@ -690,6 +756,22 @@ def main():
                     (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
                     0.65, (0, 220, 0), 2,
                 )
+
+                with state["lock"]:
+                    page_quad = state["last_page_quad"]
+                    stable_frames = state["stable_frames"]
+
+                if page_quad is not None:
+                    pts = page_quad.astype(int)
+                    cv2.polylines(display, [pts], True, (0, 165, 255), 2)
+                    if AUTO_CAPTURE_ENABLED and stable_frames >= PAGE_STABLE_FRAMES:
+                        cv2.putText(
+                            display,
+                            "Auto capture ready",
+                            (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 165, 255), 2,
+                        )
+
                 cv2.imshow("OCR to TTS Reader", display)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -710,7 +792,9 @@ def main():
                 while True:
                     cmd = cmd_queue.get_nowait()
                     if cmd == "capture":
-                        capture_and_read(frame, tts, state)
+                        with state["lock"]:
+                            quad = state["last_page_quad"]
+                        capture_and_read(frame, tts, state, quad)
                     elif cmd == "repeat":
                         with state["lock"]:
                             txt = state["last_text"]
@@ -729,6 +813,37 @@ def main():
                         raise _QuitSignal()
             except queue.Empty:
                 pass
+
+            # ── Page edge detection + auto capture ─────────
+            if AUTO_CAPTURE_ENABLED or not HEADLESS:
+                page_quad = detect_page_quad(frame)
+                with state["lock"]:
+                    prev_quad = state["last_page_quad"]
+                    if page_quad is not None:
+                        if prev_quad is not None and _quad_mean_shift(prev_quad, page_quad) <= MAX_QUAD_SHIFT:
+                            state["stable_frames"] += 1
+                        else:
+                            state["stable_frames"] = 1
+                        state["last_page_quad"] = page_quad
+                    else:
+                        state["stable_frames"] = 0
+                        state["last_page_quad"] = None
+
+                    stable_frames = state["stable_frames"]
+                    last_auto = state["last_auto_capture"]
+                    ocr_busy = state["ocr_busy"]
+
+                if (
+                    AUTO_CAPTURE_ENABLED
+                    and page_quad is not None
+                    and not ocr_busy
+                    and stable_frames >= PAGE_STABLE_FRAMES
+                    and (time.monotonic() - last_auto) >= AUTO_CAPTURE_COOLDOWN
+                ):
+                    capture_and_read(frame, tts, state, page_quad)
+                    with state["lock"]:
+                        state["stable_frames"] = 0
+                        state["last_auto_capture"] = time.monotonic()
 
     except _QuitSignal:
         pass
@@ -766,6 +881,10 @@ def _drain_cmd_queue_for_quit(cmd_queue: queue.Queue):
         cmd_queue.put(cmd)
     except queue.Empty:
         pass
+
+
+def _quad_mean_shift(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.mean(np.linalg.norm(a - b, axis=1)))
 
 
 if __name__ == "__main__":
